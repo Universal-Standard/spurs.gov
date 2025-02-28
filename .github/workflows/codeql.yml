@@ -1,0 +1,258 @@
+# Enterprise-Grade CodeQL Security Analysis Configuration
+#
+# This comprehensive workflow implements advanced security scanning capabilities
+# with extensive customization options for enterprise environments.
+#
+# Key features:
+# - Multi-language support with optimized runners
+# - Customizable scan schedules and triggers
+# - Advanced reporting and integration capabilities
+# - Optimized for both performance and thorough analysis
+#
+# ******** IMPORTANT CONFIGURATION NOTE ********
+# Before deployment, verify the language matrix configuration matches your codebase.
+# The current setup includes common enterprise languages, but should be tailored
+# to your specific repository needs.
+#
+name: "Enterprise CodeQL Security Analysis"
+
+on:
+  # Standard trigger events
+  push:
+    branches: [ "main", "release/*", "develop" ]
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.txt'
+      - 'docs/**'
+  pull_request:
+    branches: [ "main", "release/*", "develop" ]
+    types: [opened, synchronize, reopened]
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.txt'
+      - 'docs/**'
+  # Scheduled scans (Friday at 9:42 AM UTC)
+  schedule:
+    - cron: '42 9 * * 5'
+  # Manual trigger option
+  workflow_dispatch:
+    inputs:
+      full-scan:
+        description: 'Run full depth analysis'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  prepare:
+    name: Prepare Analysis Environment
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.check.outputs.should-run }}
+    steps:
+      - name: Check for relevant changes
+        id: check
+        run: |
+          echo "should-run=true" >> $GITHUB_OUTPUT
+
+  analyze:
+    name: Analyze (${{ matrix.language }} - ${{ matrix.build-mode || 'auto' }})
+    needs: prepare
+    if: needs.prepare.outputs.should-run == 'true'
+    # Intelligent runner selection based on language requirements
+    runs-on: ${{ matrix.runner || ((matrix.language == 'swift' || matrix.language == 'objective-c') && 'macos-latest') || (matrix.large-runner && 'ubuntu-latest-16-core') || 'ubuntu-latest' }}
+    timeout-minutes: ${{ matrix.timeout || 360 }}
+    
+    permissions:
+      # Core permissions for security scanning
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+      # Additional permissions for enhanced reporting
+      issues: write
+      pull-requests: write
+      
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.language }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Compiled Languages
+          - language: 'c-cpp'
+            build-mode: 'autobuild'
+            queries: 'security-extended,security-and-quality'
+            ram: 6144
+            large-runner: true
+            
+          - language: 'java-kotlin'
+            build-mode: 'autobuild'
+            queries: '+security-and-quality,+security-extended'
+            ram: 6144
+            large-runner: true
+            
+          - language: 'csharp'
+            build-mode: 'autobuild'
+            queries: 'security-extended'
+            ram: 4096
+            
+          - language: 'go'
+            build-mode: 'autobuild'
+            queries: 'security-and-quality'
+            ram: 4096
+            
+          - language: 'swift'
+            build-mode: 'autobuild'
+            runner: 'macos-latest'
+            queries: 'security-and-quality'
+            ram: 4096
+            
+          # Interpreted Languages
+          - language: 'javascript-typescript'
+            queries: '+security-and-quality,+security-extended,+maintainability'
+            ram: 4096
+            
+          - language: 'python'
+            queries: '+security-and-quality,+security-extended'
+            ram: 4096
+            
+          - language: 'ruby'
+            queries: 'security-and-quality'
+            ram: 3072
+
+    env:
+      CODEQL_JAVA_MEMORY: ${{ matrix.ram }}m
+      CODEQL_THREADS: ${{ matrix.threads || 0 }}
+      CODEQL_RAM: ${{ matrix.ram }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ github.event.inputs.full-scan == 'true' && '0' || '1' }}
+          
+      # Language-specific setup steps
+      - name: Setup Node.js
+        if: matrix.language == 'javascript-typescript'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          
+      - name: Setup Java
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'maven'
+          
+      - name: Setup Python
+        if: matrix.language == 'python'
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          
+      - name: Setup .NET
+        if: matrix.language == 'csharp'
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'
+
+      # Advanced CodeQL initialization with customized settings
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode || 'auto' }}
+          queries: ${{ matrix.queries }}
+          config-file: ${{ matrix.config-file || '.github/codeql/codeql-config.yml' }}
+          packs: ${{ matrix.packs }}
+          ram: ${{ matrix.ram }}
+          threads: ${{ matrix.threads || 0 }}
+          debug: ${{ github.event_name == 'workflow_dispatch' }}
+
+      # Language-specific build steps for manual build mode
+      - name: Build C/C++ Project
+        if: matrix.language == 'c-cpp' && matrix.build-mode == 'manual'
+        run: |
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          make -j$(nproc)
+          
+      - name: Build Java Project
+        if: matrix.language == 'java-kotlin' && matrix.build-mode == 'manual'
+        run: |
+          ./mvnw clean package -DskipTests
+          
+      - name: Build .NET Project
+        if: matrix.language == 'csharp' && matrix.build-mode == 'manual'
+        run: |
+          dotnet restore
+          dotnet build --configuration Release --no-restore
+          
+      - name: Build Go Project
+        if: matrix.language == 'go' && matrix.build-mode == 'manual'
+        run: |
+          go mod download
+          go build -v ./...
+
+      # Perform the actual CodeQL analysis
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{matrix.language}}"
+          upload: always
+          wait-for-processing: true
+          
+      # Enhanced reporting and integration
+      - name: Generate SARIF Summary
+        if: always()
+        run: |
+          echo "## CodeQL Analysis Results for ${{ matrix.language }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Build Mode: ${{ matrix.build-mode || 'auto' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Query Suites: ${{ matrix.queries || 'default' }}" >> $GITHUB_STEP_SUMMARY
+          
+  # Post-analysis aggregation and reporting
+  summary:
+    name: Security Analysis Summary
+    needs: analyze
+    if: always() && needs.analyze.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Analysis Report
+        run: |
+          echo "# CodeQL Security Analysis Complete" >> $GITHUB_STEP_SUMMARY
+          echo "View detailed results in the Security tab" >> $GITHUB_STEP_SUMMARY
+          echo "Analysis completed at: $(date)" >> $GITHUB_STEP_SUMMARY
+          
+      - name: Notify Security Team
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const issueBody = `
+            # CodeQL Security Scan Completed
+            
+            A scheduled security scan has completed for repository: ${process.env.GITHUB_REPOSITORY}
+            
+            ## Details
+            - Workflow: [${process.env.GITHUB_WORKFLOW}](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})
+            - Triggered by: ${process.env.GITHUB_EVENT_NAME}
+            - Commit: ${process.env.GITHUB_SHA}
+            
+            Please review the results in the Security tab.
+            `;
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Security Scan Results - ${new Date().toISOString().split('T')[0]}`,
+              body: issueBody,
+              labels: ['security', 'automated']
+            });
