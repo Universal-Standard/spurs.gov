@@ -1,0 +1,144 @@
+name: Labeler and PR Automation
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled] # Trigger on more PR events
+  issue_comment:
+    types: [created]  # Trigger when a comment is created on an issue or PR
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+    - uses: actions/checkout@v3 #Checkout code so that modified files can be accessed.
+    - name: Label PR based on file changes
+      uses: actions/labeler@v4
+      with:
+        repo-token: "${{ secrets.GITHUB_TOKEN }}"
+        configuration-path: .github/labeler.yml # Explicitly define the config path. Good practice.
+
+    - name: Apply Size Label
+      id: size_label
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const github = context.github;
+          const context = github.context;
+          const prNumber = context.payload.pull_request.number;
+
+          // Get the changed files in the PR
+          const { data: changedFiles } = await github.rest.pulls.listFiles({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            pull_number: prNumber,
+          });
+
+          let totalChanges = 0;
+          changedFiles.forEach(file => {
+            totalChanges += file.additions + file.deletions;
+          });
+
+          let sizeLabel = '';
+          if (totalChanges < 10) {
+            sizeLabel = 'size/xs';
+          } else if (totalChanges < 50) {
+            sizeLabel = 'size/s';
+          } else if (totalChanges < 200) {
+            sizeLabel = 'size/m';
+          } else if (totalChanges < 500) {
+            sizeLabel = 'size/l';
+          } else {
+            sizeLabel = 'size/xl';
+          }
+
+          if (sizeLabel) {
+            try{
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: [sizeLabel]
+              });
+            } catch (error) {
+              console.log(`Error adding label: ${error}`);
+            }
+          }
+          console.log(`Total changes: ${totalChanges}, Size label: ${sizeLabel}`);
+          return sizeLabel;  # Return the label to be used in subsequent steps, if needed.
+
+    - name: Request Review (Optional - Conditionally based on label, for example)
+      if: steps.size_label.outputs.result != '' && github.event_name == 'pull_request_target'  # Only request on initial PR creation, and when size label was added
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const github = context.github;
+          const context = github.context;
+          const prNumber = context.payload.pull_request.number;
+
+          // Add reviewers based on the PR size, configuration, etc.  For demonstration, let's just add a default reviewer.
+          // This can be customized with different reviewers for different file types/areas.
+
+          const reviewers = ['your-github-username']; // Replace with actual usernames. Can be dynamically generated
+          const team_reviewers = ['your-team-name']; // Replace with actual team names.  Can be dynamically generated
+
+          try {
+            await github.rest.pulls.requestReviewers({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              reviewers: reviewers,
+              team_reviewers: team_reviewers
+            });
+          } catch (error) {
+            console.log(`Error requesting reviewers: ${error}`);
+          }
+  comment_and_close:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+
+    steps:
+    - name: Check for "close" comment and close PR
+      if: github.event_name == 'issue_comment' && contains(github.event.comment.body, '/close')
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const github = context.github;
+          const context = github.context;
+          const issue_number = context.payload.issue.number;
+          // Check if the comment was made by someone with write access
+          const { data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            username: context.payload.comment.user.login
+          });
+
+          if (permission.permission === 'admin' || permission.permission === 'write') {
+            // Close the pull request
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: issue_number,
+              state: 'closed'
+            });
+
+            // Add a comment explaining why the PR was closed
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue_number,
+              body: `This pull request has been closed by @${context.payload.comment.user.login} as requested via the \`/close\` command.`
+            });
+          } else {
+             await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue_number,
+              body: `Sorry @${context.payload.comment.user.login}, only users with write access can close this pull request using the /close command.`
+            });
+
+          }
